@@ -1,0 +1,311 @@
+import { Hono } from "hono"
+import { z } from "zod"
+import { type Address, type Hex, encodeFunctionData, getAddress, parseAbi } from "viem"
+import { privateKeyToAccount } from "viem/accounts"
+import {
+  BASE_CHAIN_ID,
+  BrokerSettlementError,
+  BrokerVerificationError,
+  USDC_BASE,
+  type SpecialistKind,
+  SPECIALIST_TO_VENICE,
+} from "@delegate/shared"
+import { loadEnv } from "../env"
+import { logger } from "../log"
+import { OneShotClient, type OneShotCapabilities, type OneShotAuthorizationListEntry } from "../oneshot"
+import { VeniceClient } from "../venice"
+import { state } from "../state"
+
+const SPECIALIST_KINDS = ["concept", "image", "voice", "music", "video"] as const
+
+const HEX_BYTES = /^0x[a-fA-F0-9]*$/
+const ADDRESS_REGEX = /^0x[a-fA-F0-9]{40}$/
+
+const AuthorizationListEntrySchema = z.object({
+  chainId: z.string(),
+  contractAddress: z.string().regex(ADDRESS_REGEX),
+  nonce: z.string().regex(HEX_BYTES),
+  signature: z.string().regex(HEX_BYTES),
+})
+
+const PaymentEnvelopeSchema = z.object({
+  scheme: z.literal("delegate-run-v1"),
+  network: z.literal("eip155:8453"),
+  amountAtoms: z.string().regex(/^\d+$/),
+  briefId: z.string().regex(/^0x[a-fA-F0-9]{64}$/),
+  specialistKind: z.enum(SPECIALIST_KINDS),
+  delegationContext: z.string().regex(HEX_BYTES),
+  delegationManager: z.string().regex(ADDRESS_REGEX).optional(),
+  authorizationList: z.array(AuthorizationListEntrySchema).optional(),
+})
+
+type PaymentEnvelope = z.infer<typeof PaymentEnvelopeSchema>
+
+function parsePaymentHeader(header: string | null): PaymentEnvelope | null {
+  if (!header) return null
+  try {
+    const json = Buffer.from(header, "base64").toString("utf8")
+    const obj = JSON.parse(json)
+    return PaymentEnvelopeSchema.parse(obj)
+  } catch (err) {
+    logger.debug({ err }, "failed to parse X-PAYMENT envelope")
+    return null
+  }
+}
+
+interface RouteContext {
+  oneShot: OneShotClient
+  venice: VeniceClient
+  brokerAddress: Address
+  webhookUrl: string
+  delegationManager: Address
+  capabilitiesCache?: { ts: number; value: OneShotCapabilities }
+  upgradedEoas: Set<string>
+}
+
+let context: RouteContext | undefined
+
+function getContext(): RouteContext {
+  if (context) return context
+  const env = loadEnv()
+  const floatAccount = privateKeyToAccount(env.BROKER_FLOAT_PRIVATE_KEY)
+  context = {
+    oneShot: new OneShotClient({ endpoint: env.ONESHOT_RELAYER_URL }),
+    venice: new VeniceClient({
+      apiBase: env.VENICE_API_BASE,
+      payTo: env.VENICE_PAY_TO,
+      floatPrivateKey: env.BROKER_FLOAT_PRIVATE_KEY,
+      usdc: env.USDC_BASE,
+      chainId: BASE_CHAIN_ID,
+    }),
+    brokerAddress: floatAccount.address,
+    webhookUrl: `${env.ONESHOT_WEBHOOK_PUBLIC_BASE_URL.replace(/\/+$/, "")}/webhook/relay`,
+    delegationManager: env.DELEGATION_MANAGER_ADDRESS,
+    upgradedEoas: new Set(),
+  }
+  return context
+}
+
+const ERC20_ABI = parseAbi(["function transfer(address to, uint256 amount) returns (bool)"])
+
+function encodeErc20Transfer(to: Address, amount: bigint): Hex {
+  return encodeFunctionData({
+    abi: ERC20_ABI,
+    functionName: "transfer",
+    args: [to, amount],
+  })
+}
+
+async function getCapabilitiesCached(ctx: RouteContext): Promise<OneShotCapabilities> {
+  const ttlMs = 60_000
+  if (ctx.capabilitiesCache && Date.now() - ctx.capabilitiesCache.ts < ttlMs) {
+    return ctx.capabilitiesCache.value
+  }
+  const all = await ctx.oneShot.getCapabilities([BASE_CHAIN_ID])
+  const caps = all[BASE_CHAIN_ID.toString()]
+  if (!caps) throw new BrokerSettlementError("1Shot returned no capabilities for Base mainnet")
+  ctx.capabilitiesCache = { ts: Date.now(), value: caps }
+  return caps
+}
+
+interface SettleArgs {
+  ctx: RouteContext
+  envelope: PaymentEnvelope
+}
+
+interface SettleResult {
+  taskId: Hex
+  hash?: Hex
+}
+
+async function relayDelegationRedemption(args: SettleArgs): Promise<SettleResult> {
+  const { ctx, envelope } = args
+  const caps = await getCapabilitiesCached(ctx)
+  const feeCollector = caps.feeCollector
+  const usdcToken = caps.tokens.find((t) => t.address.toLowerCase() === USDC_BASE.toLowerCase())
+  if (!usdcToken) {
+    throw new BrokerSettlementError("USDC not listed in 1Shot capabilities for Base mainnet")
+  }
+
+  const quote = await ctx.oneShot.getFeeData({ chainId: BASE_CHAIN_ID, token: USDC_BASE })
+  const feeAtoms = BigInt(quote.minFee)
+  const paymentAtoms = BigInt(envelope.amountAtoms)
+
+  const executions = [
+    { to: USDC_BASE, value: "0", data: encodeErc20Transfer(feeCollector, feeAtoms) },
+    { to: USDC_BASE, value: "0", data: encodeErc20Transfer(ctx.brokerAddress, paymentAtoms) },
+  ]
+
+  const authorizationList: OneShotAuthorizationListEntry[] | undefined =
+    envelope.authorizationList && envelope.authorizationList.length > 0
+      ? envelope.authorizationList.map((a) => ({
+          chainId: a.chainId,
+          contractAddress: getAddress(a.contractAddress),
+          nonce: a.nonce as Hex,
+          signature: a.signature as Hex,
+        }))
+      : undefined
+
+  const sent = await ctx.oneShot.send7710Transaction({
+    chainId: BASE_CHAIN_ID,
+    context: quote.context,
+    destinationUrl: ctx.webhookUrl,
+    authorizationList,
+    transactions: [
+      {
+        permissionContext: [envelope.delegationContext as Hex],
+        executions,
+      },
+    ],
+  })
+
+  state.recordTask({
+    taskId: sent.taskId,
+    briefId: envelope.briefId as Hex,
+    specialistKind: envelope.specialistKind,
+    status: "Pending",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    meta: {
+      amountAtoms: envelope.amountAtoms,
+      feeAtoms: feeAtoms.toString(),
+      had7702: !!authorizationList,
+    },
+  })
+
+  state.emit({
+    briefId: envelope.briefId as Hex,
+    ts: Date.now(),
+    kind: "broker.relay.submitted",
+    specialistKind: envelope.specialistKind,
+    details: {
+      taskId: sent.taskId,
+      amountAtoms: envelope.amountAtoms,
+      feeAtoms: feeAtoms.toString(),
+    },
+  })
+
+  if (authorizationList) {
+    state.emit({
+      briefId: envelope.briefId as Hex,
+      ts: Date.now(),
+      kind: "operator.upgrade.7702.signed",
+      specialistKind: envelope.specialistKind,
+      details: {
+        target: authorizationList[0]!.contractAddress,
+      },
+    })
+  }
+
+  return { taskId: sent.taskId }
+}
+
+async function awaitTaskConfirmed(args: {
+  ctx: RouteContext
+  taskId: Hex
+  timeoutMs: number
+}): Promise<{ hash?: Hex }> {
+  const start = Date.now()
+  while (Date.now() - start < args.timeoutMs) {
+    const status = await args.ctx.oneShot.getStatus(args.taskId)
+    if (status.code === 200) return { hash: status.hash }
+    if (status.code === 400 || status.code === 500) {
+      throw new BrokerSettlementError(
+        `relay terminal status ${status.label}: ${status.message ?? status.data ?? ""}`,
+      )
+    }
+    await new Promise((r) => setTimeout(r, 1500))
+  }
+  throw new BrokerSettlementError(`relay timed out after ${args.timeoutMs}ms`)
+}
+
+export const brokerRoute = new Hono()
+
+brokerRoute.post("/venice/:specialistKind", async (c) => {
+  const ctx = getContext()
+  const kindParam = c.req.param("specialistKind") as SpecialistKind
+  if (!SPECIALIST_KINDS.includes(kindParam)) return c.text("unknown specialist", 404)
+
+  const envelope = parsePaymentHeader(c.req.header("x-payment") ?? c.req.header("X-PAYMENT") ?? null)
+  if (!envelope) {
+    return c.json(
+      {
+        x402Version: 1,
+        error: "X-PAYMENT (delegate-run-v1) header required",
+        accepts: [
+          {
+            scheme: "delegate-run-v1",
+            network: "eip155:8453",
+            description: `delegate.run broker for venice ${SPECIALIST_TO_VENICE[kindParam]}`,
+            payTo: ctx.brokerAddress,
+            asset: USDC_BASE,
+            maxTimeoutSeconds: 120,
+          },
+        ],
+      },
+      402,
+    )
+  }
+
+  if (envelope.specialistKind !== kindParam) {
+    throw new BrokerVerificationError("specialistKind mismatch between url and envelope")
+  }
+
+  const { taskId } = await relayDelegationRedemption({ ctx, envelope })
+  const { hash } = await awaitTaskConfirmed({ ctx, taskId, timeoutMs: 90_000 })
+
+  const veniceEndpoint = SPECIALIST_TO_VENICE[kindParam]
+  const requestBody = (await c.req.json().catch(() => null)) as unknown
+  if (requestBody === null) {
+    throw new BrokerVerificationError("missing JSON body for venice call")
+  }
+
+  state.emit({
+    briefId: envelope.briefId as Hex,
+    ts: Date.now(),
+    kind: "specialist.venice.request",
+    specialistKind: kindParam,
+    details: { veniceEndpoint, priceAtoms: envelope.amountAtoms },
+  })
+
+  const veniceResult = await ctx.venice.call({
+    endpoint: veniceEndpoint,
+    body: requestBody,
+    priceAtoms: BigInt(envelope.amountAtoms),
+  })
+
+  state.emit({
+    briefId: envelope.briefId as Hex,
+    ts: Date.now(),
+    kind: "specialist.venice.response",
+    specialistKind: kindParam,
+    details: {
+      veniceEndpoint,
+      balanceRemaining: veniceResult.balanceRemaining,
+      paymentTxHash: veniceResult.paymentTxHash,
+      settlementHash: hash,
+    },
+  })
+
+  if (typeof veniceResult.body === "object" && veniceResult.body !== null && !(veniceResult.body instanceof ArrayBuffer)) {
+    return c.json({
+      brokerSettlementTaskId: taskId,
+      brokerSettlementTxHash: hash,
+      venicePaymentTxHash: veniceResult.paymentTxHash,
+      veniceBalanceRemaining: veniceResult.balanceRemaining,
+      contentType: veniceResult.contentType,
+      data: veniceResult.body,
+    })
+  }
+
+  const buffer = veniceResult.body as ArrayBuffer
+  return new Response(buffer, {
+    status: 200,
+    headers: {
+      "content-type": veniceResult.contentType,
+      "x-broker-settlement-task": taskId,
+      "x-broker-settlement-tx": hash ?? "",
+      "x-venice-payment-tx": veniceResult.paymentTxHash ?? "",
+    },
+  })
+})
